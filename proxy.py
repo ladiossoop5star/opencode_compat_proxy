@@ -214,7 +214,7 @@ def build_stream_tool_call_chunks(tool_calls, chunk_id, model):
     return chunks
 
 
-async def stream_compat_response(upstream_req):
+async def stream_compat_response(upstream_req, client_host="unknown"):
     chunk_id = "chatcmpl-" + uuid.uuid4().hex[:12]
     model = upstream_req.get("model", "deepseek")
     raw_buffer = ""
@@ -228,7 +228,7 @@ async def stream_compat_response(upstream_req):
                 "POST",
                 UPSTREAM + "/v1/chat/completions",
                 json=upstream_req,
-                headers={"Accept": "text/event-stream"},
+                headers={"Accept": "text/event-stream", "x-forwarded-for": client_host},
                 timeout=None,
             ) as resp:
                 async for line in resp.aiter_lines():
@@ -352,14 +352,16 @@ async def proxy(request: Request):
     body = await request.json()
     stream = body.get("stream", False)
 
+    client_host = request.client.host if request.client else "unknown"
     upstream_headers = strip_hop_by_hop_headers(dict(request.headers))
     upstream_headers.pop("host", None)
     upstream_headers["content-type"] = "application/json"
+    upstream_headers["x-forwarded-for"] = upstream_headers.get("x-forwarded-for", client_host)
 
     upstream_req = dict(body)
 
     if stream:
-        return await stream_compat_response(upstream_req)
+        return await stream_compat_response(upstream_req, client_host)
 
     async with httpx.AsyncClient() as client:
         resp = await client.post(

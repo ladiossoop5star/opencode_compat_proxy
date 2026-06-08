@@ -356,7 +356,8 @@ async def proxy(request: Request):
     upstream_headers = strip_hop_by_hop_headers(dict(request.headers))
     upstream_headers.pop("host", None)
     upstream_headers["content-type"] = "application/json"
-    upstream_headers["x-forwarded-for"] = upstream_headers.get("x-forwarded-for", client_host)
+    existing_forwarded = upstream_headers.get("x-forwarded-for", "")
+    upstream_headers["x-forwarded-for"] = f"{existing_forwarded}, {client_host}" if existing_forwarded else client_host
 
     upstream_req = dict(body)
 

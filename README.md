@@ -39,6 +39,8 @@ The proxy sits between OpenCode and the LLM backend (e.g. vLLM, llama.cpp). It i
 
 ## Installation
 
+### Option A — Manual
+
 ```bash
 git clone https://github.com/ladiossoop5star/opencode_compat_proxy.git
 cd opencode_compat_proxy
@@ -46,6 +48,14 @@ python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 ```
+
+### Option B — Let AI do it
+
+Give this entire README to any capable AI coding assistant (Claude, ChatGPT, etc.) with a prompt like:
+
+> Read this README and install the project on my machine.
+
+The AI will handle cloning, setting up the environment, and starting the proxy.
 
 ## Usage
 

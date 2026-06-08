@@ -51,10 +51,10 @@ pip install -r requirements.txt
 
 ### 1. Configure upstream backend
 
-Set the `UPSTREAM_BASE` environment variable (defaults to `http://0.0.0.0:8004`):
+Set the `UPSTREAM_BASE` environment variable (defaults to `http://127.0.0.1:8004`):
 
 ```bash
-export UPSTREAM_BASE="http://0.0.0.0:8004"
+export UPSTREAM_BASE="http://127.0.0.1:8004"
 ```
 
 ### 3. Start the proxy
@@ -65,12 +65,28 @@ uvicorn proxy:app --host 0.0.0.0 --port 9526
 
 ### 4. Configure OpenCode
 
-Point OpenCode's `baseURL` to the proxy in your `opencode.jsonc`:
+Add a provider entry pointing to the proxy in your `opencode.jsonc`:
 
-```json
-"options": {
-    "baseURL": "http://0.0.0.0:9526/v1"
-}
+```jsonc
+"provider": {
+    "my-model": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "My Model",
+      "options": {
+        "baseURL": "http://127.0.0.1:9526/v1",
+        "apiKey": "dummy"
+      },
+      "models": {
+        "my-model": {
+          "name": "My Model",
+          "limit": {
+            "context": 32768,
+            "output": 8192
+          }
+        }
+      }
+    }
+  }
 ```
 
 ### Run as a systemd service (optional)
@@ -94,7 +110,7 @@ WantedBy=multi-user.target
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `UPSTREAM_BASE` | `http://0.0.0.0:8004` | Base URL of the upstream LLM backend |
+| `UPSTREAM_BASE` | `http://127.0.0.1:8004` | Base URL of the upstream LLM backend |
 
 ## How It Works
 

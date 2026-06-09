@@ -218,11 +218,10 @@ async def stream_compat_response(upstream_req, forwarded_for=""):
     chunk_id = "chatcmpl-" + uuid.uuid4().hex[:12]
     model = upstream_req.get("model", "deepseek")
     raw_buffer = ""
-    deferred_chunks = []
+    tool_mode = False
 
     async def generate():
-        nonlocal raw_buffer
-        sent_role = False
+        nonlocal raw_buffer, tool_mode
         req_headers = {"Accept": "text/event-stream"}
         if forwarded_for:
             req_headers["x-forwarded-for"] = forwarded_for
@@ -237,115 +236,31 @@ async def stream_compat_response(upstream_req, forwarded_for=""):
                 async for line in resp.aiter_lines():
                     if not line:
                         continue
-                    if not line.startswith("data: "):
+                    yield line + "\n"
+                    if not line.startswith("data: ") or line.strip() == "data: [DONE]":
                         continue
-                    parsed = sse_json(line)
-                    if not parsed:
+                    try:
+                        chunk = json.loads(line[6:])
+                    except json.JSONDecodeError:
                         continue
-                    if parsed.get("done"):
-                        break
-
-                    chunk = parsed
-                    choices = chunk.get("choices", [])
-                    if not choices:
+                    delta = next((c.get("delta", {}) for c in chunk.get("choices", [])), {})
+                    text = ""
+                    for field in ("content", "reasoning", "reasoning_content"):
+                        val = delta.get(field)
+                        if isinstance(val, str) and val:
+                            text += val
+                    if not text:
                         continue
-                    choice = choices[0]
-                    delta = choice.get("delta", {})
-
-                    # Strip empty tool_calls array from vLLM (it sends tool_calls: [] on every content chunk)
-                    tc_val = delta.get("tool_calls")
-                    has_real_tc = bool(tc_val)
-                    if "tool_calls" in delta and not has_real_tc:
-                        delta = {k: v for k, v in delta.items() if k != "tool_calls"}
-                        patched = dict(chunk)
-                        patched["choices"] = [dict(choice, delta=delta)]
-                        chunk = patched
-
-                    has_tc_field = has_real_tc
-                    has_role_only = "role" in delta and len(delta) == 1
-                    has_empty_content = (
-                        "content" in delta
-                        and not delta.get("content")
-                        and len(delta) == 1
-                    )
-                    has_reasoning_only = (
-                        "reasoning" in delta
-                        and "content" not in delta
-                        and "tool_calls" not in delta
-                    )
-                    has_content_only = (
-                        "content" in delta
-                        and delta.get("content")
-                        and len(delta) == 1
-                    )
-
-                    if has_tc_field:
-                        for c in deferred_chunks:
-                            yield "data: " + json.dumps(c) + "\n\n"
-                        deferred_chunks.clear()
-                        raw_buffer = ""
-                        yield "data: " + json.dumps(chunk) + "\n\n"
-                        continue
-
-                    if has_role_only or has_empty_content:
-                        stripped = {k: v for k, v in delta.items() if v}
-                        if stripped:
-                            patched = dict(chunk)
-                            patched["choices"] = [dict(choice, delta=stripped)]
-                            yield "data: " + json.dumps(patched) + "\n\n"
-                        continue
-
-                    if has_content_only:
-                        text = delta["content"]
-                        raw_buffer += text
-                        yield "data: " + json.dumps(chunk) + "\n\n"
-
-                        if has_complete_raw_tool_block(raw_buffer):
-                            raw_tool_calls = parse_raw_tool_calls(raw_buffer)
-                            if raw_tool_calls:
-                                raw_buffer = ""
-                                for tc_chunk in build_stream_tool_call_chunks(
-                                    raw_tool_calls, chunk_id, model
-                                ):
-                                    yield "data: " + json.dumps(tc_chunk) + "\n\n"
-                                return
-                        continue
-
-                    if has_reasoning_only:
-                        reasoning_text = delta.get("reasoning") or delta.get("reasoning_content") or ""
-                        raw_buffer += reasoning_text
-                        yield "data: " + json.dumps(chunk) + "\n\n"
-
-                        if has_complete_raw_tool_block(raw_buffer):
-                            raw_tool_calls = parse_raw_tool_calls(raw_buffer)
-                            if raw_tool_calls:
-                                raw_buffer = ""
-                                for tc_chunk in build_stream_tool_call_chunks(
-                                    raw_tool_calls, chunk_id, model
-                                ):
-                                    yield "data: " + json.dumps(tc_chunk) + "\n\n"
-                                return
-                        continue
-
-                    yield "data: " + json.dumps(chunk) + "\n\n"
-
-                if raw_buffer and has_complete_raw_tool_block(raw_buffer):
-                    raw_tool_calls = parse_raw_tool_calls(raw_buffer)
-                    if raw_tool_calls:
-                        deferred_chunks.clear()
-                        raw_buffer = ""
-                        for tc_chunk in build_stream_tool_call_chunks(
-                            raw_tool_calls, chunk_id, model
-                        ):
-                            yield "data: " + json.dumps(tc_chunk) + "\n\n"
-                        yield "data: [DONE]\n\n"
-                        return
-
-                for c in deferred_chunks:
-                    yield "data: " + json.dumps(c) + "\n\n"
-                deferred_chunks.clear()
-
-                yield "data: [DONE]\n\n"
+                    raw_buffer += text
+                    if has_complete_raw_tool_block(raw_buffer):
+                        tool_calls = parse_raw_tool_calls(raw_buffer)
+                        if tool_calls:
+                            raw_buffer = ""
+                            for tc_chunk in build_stream_tool_call_chunks(
+                                tool_calls, chunk_id, model
+                            ):
+                                yield "data: " + json.dumps(tc_chunk) + "\n\n"
+                            return
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 
@@ -367,6 +282,9 @@ async def proxy(request: Request):
     if not upstream_headers.get("x-forwarded-for"):
         upstream_headers["x-forwarded-for"] = client_host
 
+    if stream:
+        return await stream_compat_response(j, upstream_headers["x-forwarded-for"])
+
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             UPSTREAM + "/v1/chat/completions",
@@ -375,16 +293,12 @@ async def proxy(request: Request):
             timeout=None,
         )
 
-    content = resp.content
-    if not stream:
-        try:
-            result = resp.json()
-            result = convert_non_streaming_response(result)
-            return JSONResponse(content=result, status_code=resp.status_code)
-        except Exception:
-            pass
-
-    return Response(content=content, status_code=resp.status_code, headers=dict(resp.headers))
+    try:
+        result = resp.json()
+        result = convert_non_streaming_response(result)
+        return JSONResponse(content=result, status_code=resp.status_code)
+    except Exception:
+        return Response(content=resp.content, status_code=resp.status_code, headers=dict(resp.headers))
 
 
 @app.get("/v1/models")

@@ -317,15 +317,34 @@ async def proxy(request: Request):
         )
 
     if stream:
-        body_text = normalize_raw_tool_calls(upstream_resp.text)
-        if has_complete_raw_tool_block(body_text):
-            tool_calls = parse_raw_tool_calls(body_text)
+        # Parse SSE lines, extract content for DSML detection
+        sse_lines = upstream_resp.text.splitlines()
+        full_content = ""
+        parsed_events = []
+        for line in sse_lines:
+            if line.startswith("data: "):
+                payload = line[6:].strip()
+                if payload == "[DONE]":
+                    continue
+                try:
+                    ev = json.loads(payload)
+                    parsed_events.append(ev)
+                    delta = next((c.get("delta", {}) for c in ev.get("choices", [])), {})
+                    for field in ("content", "reasoning", "reasoning_content"):
+                        val = delta.get(field)
+                        if isinstance(val, str):
+                            full_content += val
+                except json.JSONDecodeError:
+                    pass
+        normalized = normalize_raw_tool_calls(full_content)
+        if has_complete_raw_tool_block(normalized):
+            tool_calls = parse_raw_tool_calls(normalized)
             if tool_calls:
                 chunk_id = "chatcmpl-" + uuid.uuid4().hex[:12]
                 model = j.get("model", "deepseek")
                 tool_chunks = build_stream_tool_call_chunks(tool_calls, chunk_id, model)
                 lines = []
-                for line in upstream_resp.text.splitlines():
+                for line in sse_lines:
                     if not line.startswith("data: ") or line.strip() == "data: [DONE]":
                         lines.append(line)
                         continue

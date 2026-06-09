@@ -282,23 +282,23 @@ async def proxy(request: Request):
     if not upstream_headers.get("x-forwarded-for"):
         upstream_headers["x-forwarded-for"] = client_host
 
-    if stream:
-        return await stream_compat_response(j, upstream_headers["x-forwarded-for"])
-
     async with httpx.AsyncClient() as client:
-        resp = await client.post(
+        upstream_resp = await client.post(
             UPSTREAM + "/v1/chat/completions",
             content=body_bytes,
             headers=upstream_headers,
             timeout=None,
         )
 
+    if stream:
+        return Response(content=upstream_resp.content, status_code=upstream_resp.status_code, headers=dict(upstream_resp.headers))
+
     try:
-        result = resp.json()
+        result = upstream_resp.json()
         result = convert_non_streaming_response(result)
-        return JSONResponse(content=result, status_code=resp.status_code)
+        return JSONResponse(content=result, status_code=upstream_resp.status_code)
     except Exception:
-        return Response(content=resp.content, status_code=resp.status_code, headers=dict(resp.headers))
+        return Response(content=upstream_resp.content, status_code=upstream_resp.status_code, headers=dict(upstream_resp.headers))
 
 
 @app.get("/v1/models")

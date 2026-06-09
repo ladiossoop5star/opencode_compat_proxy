@@ -384,17 +384,30 @@ async def proxy(request: Request):
     return JSONResponse(content=result, status_code=resp.status_code)
 
 
-@app.api_route("/v1/models/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
 @app.get("/v1/models")
-async def models_proxy(request: Request, path: str = ""):
-    upstream_path = f"/v1/models/{path}" if path else "/v1/models"
+async def models_list():
     async with httpx.AsyncClient() as client:
-        resp = await client.get(UPSTREAM + upstream_path, timeout=None)
+        resp = await client.get(UPSTREAM + "/v1/models", timeout=None)
     return JSONResponse(content=resp.json(), status_code=resp.status_code)
+
+
+
 
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
 async def catch_all_proxy(request: Request, path: str):
+    # Handle per-model query: GET /v1/models/{model_id}
+    if request.method == "GET" and path.startswith("v1/models/") and path.count("/") == 2:
+        model_id = path.split("/", 2)[2]
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(UPSTREAM + "/v1/models", timeout=None)
+        if resp.status_code == 200:
+            models = resp.json().get("data", [])
+            for m in models:
+                if m.get("id") == model_id:
+                    return JSONResponse(content=m, status_code=200)
+        return JSONResponse(content={"detail": "Not Found"}, status_code=404)
+
     body_bytes = await request.body()
     upstream_headers = strip_hop_by_hop_headers(dict(request.headers))
     upstream_headers.pop("host", None)

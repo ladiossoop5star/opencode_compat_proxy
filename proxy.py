@@ -291,6 +291,30 @@ async def proxy(request: Request):
         )
 
     if stream:
+        if has_complete_raw_tool_block(upstream_resp.text):
+            tool_calls = parse_raw_tool_calls(upstream_resp.text)
+            if tool_calls:
+                chunk_id = "chatcmpl-" + uuid.uuid4().hex[:12]
+                model = j.get("model", "deepseek")
+                tool_chunks = build_stream_tool_call_chunks(tool_calls, chunk_id, model)
+                lines = []
+                for line in upstream_resp.text.splitlines():
+                    if not line.startswith("data: ") or line.strip() == "data: [DONE]":
+                        lines.append(line)
+                        continue
+                    try:
+                        ev = json.loads(line[6:])
+                        delta = next((c.get("delta", {}) for c in ev.get("choices", [])), {})
+                        if "content" in delta or "reasoning" in delta or "reasoning_content" in delta:
+                            if "role" not in delta:
+                                continue
+                    except Exception:
+                        pass
+                    lines.append(line)
+                for c in tool_chunks:
+                    lines.append("data: " + json.dumps(c))
+                lines.append("data: [DONE]")
+                return Response(content="\n".join(lines).encode(), status_code=upstream_resp.status_code, headers=dict(upstream_resp.headers))
         return Response(content=upstream_resp.content, status_code=upstream_resp.status_code, headers=dict(upstream_resp.headers))
 
     try:

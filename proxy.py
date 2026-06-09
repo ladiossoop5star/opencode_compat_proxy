@@ -30,6 +30,27 @@ DSML_BAR = chr(0xFF5C)
 DSML_OPEN = "<" + DSML_BAR + "DSML" + DSML_BAR + "tool_calls>"
 DSML_CLOSE = "</" + DSML_BAR + "DSML" + DSML_BAR + "tool_calls>"
 
+
+def normalize_raw_tool_calls(text):
+    """Normalize various DSML/Qwen XML formats to standard <｜DSML｜tool_calls> format."""
+    bar = DSML_BAR
+    # Format 1: <DSML>tool_calls> (DSML pseudo-namespace without bars)
+    if "<DSML>tool_calls>" in text:
+        text = text.replace("<DSML>tool_calls>", "<" + bar + "DSML" + bar + "tool_calls>", 1)
+        text = re.sub(r'</DSML[:\s]+tool_calls\s*>', "</" + bar + "DSML" + bar + "tool_calls>", text)
+        text = re.sub(r'<DSML[:\s]+(invoke)\s+', "<" + bar + "DSML" + bar + r"\1 ", text)
+        text = re.sub(r'<DSML[:\s]+(parameter)\s+', "<" + bar + "DSML" + bar + r"\1 ", text)
+        text = re.sub(r'</DSML[:\s]+(invoke|parameter)\s*>', "</" + bar + "DSML" + bar + r"\1>", text)
+    # Format 2: <tool_calls> (bare XML, no DSML prefix)
+    elif "<tool_calls>" in text and "</tool_calls>" in text:
+        text = text.replace("<tool_calls>", "<" + bar + "DSML" + bar + "tool_calls>", 1)
+        text = text.replace("</tool_calls>", "</" + bar + "DSML" + bar + "tool_calls>", 1)
+        text = re.sub(r'<invoke\s+', "<" + bar + "DSML" + bar + "invoke ", text)
+        text = re.sub(r'</invoke\s*>', "</" + bar + "DSML" + bar + "invoke>", text)
+        text = re.sub(r'<parameter\s+', "<" + bar + "DSML" + bar + "parameter ", text)
+        text = re.sub(r'</parameter\s*>', "</" + bar + "DSML" + bar + "parameter>", text)
+    return text
+
 app = FastAPI()
 
 
@@ -63,6 +84,10 @@ def make_tool_call(name, arguments, call_id=None):
 
 def has_complete_raw_tool_block(text):
     if DSML_OPEN in text and DSML_CLOSE in text:
+        return True
+    if "<DSML>tool_calls>" in text:
+        return True
+    if "<tool_calls>" in text and "</tool_calls>" in text:
         return True
     if "<tool_call>" in text and "</tool_call>" in text:
         return True
@@ -144,7 +169,8 @@ def convert_non_streaming_response(body):
     content = msg.get("content", "") or ""
     tool_calls = msg.get("tool_calls")
     if not tool_calls and content and has_complete_raw_tool_block(content):
-        tool_calls = parse_raw_tool_calls(content)
+        normalized = normalize_raw_tool_calls(content)
+        tool_calls = parse_raw_tool_calls(normalized)
         if tool_calls:
             msg["tool_calls"] = tool_calls
             msg["content"] = None
@@ -291,8 +317,9 @@ async def proxy(request: Request):
         )
 
     if stream:
-        if has_complete_raw_tool_block(upstream_resp.text):
-            tool_calls = parse_raw_tool_calls(upstream_resp.text)
+        body_text = normalize_raw_tool_calls(upstream_resp.text)
+        if has_complete_raw_tool_block(body_text):
+            tool_calls = parse_raw_tool_calls(body_text)
             if tool_calls:
                 chunk_id = "chatcmpl-" + uuid.uuid4().hex[:12]
                 model = j.get("model", "deepseek")

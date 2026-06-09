@@ -14,7 +14,7 @@ import uuid
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 UPSTREAM = os.environ.get("UPSTREAM_URL", "http://127.0.0.1:8000")
 HOST = os.environ.get("PROXY_HOST", "0.0.0.0")
@@ -384,11 +384,32 @@ async def proxy(request: Request):
     return JSONResponse(content=result, status_code=resp.status_code)
 
 
+@app.api_route("/v1/models/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
 @app.get("/v1/models")
-async def models_proxy(request: Request):
+async def models_proxy(request: Request, path: str = ""):
+    upstream_path = f"/v1/models/{path}" if path else "/v1/models"
     async with httpx.AsyncClient() as client:
-        resp = await client.get(UPSTREAM + "/v1/models", timeout=None)
+        resp = await client.get(UPSTREAM + upstream_path, timeout=None)
     return JSONResponse(content=resp.json(), status_code=resp.status_code)
+
+
+@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
+async def catch_all_proxy(request: Request, path: str):
+    body_bytes = await request.body()
+    upstream_headers = strip_hop_by_hop_headers(dict(request.headers))
+    upstream_headers.pop("host", None)
+    client_host = request.client.host if request.client else "unknown"
+    if not upstream_headers.get("x-forwarded-for"):
+        upstream_headers["x-forwarded-for"] = client_host
+    async with httpx.AsyncClient() as client:
+        resp = await client.request(
+            request.method,
+            UPSTREAM + "/" + path,
+            headers=upstream_headers,
+            content=body_bytes,
+            timeout=None,
+        )
+    return Response(content=resp.content, status_code=resp.status_code, headers=dict(resp.headers))
 
 
 if __name__ == "__main__":

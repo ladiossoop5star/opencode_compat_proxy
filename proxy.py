@@ -352,8 +352,13 @@ async def stream_compat_response(upstream_req, forwarded_for=""):
 
 @app.api_route("/v1/chat/completions", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
 async def proxy(request: Request):
-    body = await request.json()
-    stream = body.get("stream", False)
+    body_bytes = await request.body()
+    stream = False
+    try:
+        j = json.loads(body_bytes)
+        stream = j.get("stream", False)
+    except Exception:
+        pass
 
     client_host = request.client.host if request.client else "unknown"
     upstream_headers = strip_hop_by_hop_headers(dict(request.headers))
@@ -362,26 +367,24 @@ async def proxy(request: Request):
     if not upstream_headers.get("x-forwarded-for"):
         upstream_headers["x-forwarded-for"] = client_host
 
-    upstream_req = dict(body)
-
-    if stream:
-        return await stream_compat_response(upstream_req, upstream_headers["x-forwarded-for"])
-
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             UPSTREAM + "/v1/chat/completions",
-            json=upstream_req,
+            content=body_bytes,
             headers=upstream_headers,
             timeout=None,
         )
 
-    try:
-        result = resp.json()
-    except Exception:
-        return JSONResponse(content=resp.text, status_code=resp.status_code)
+    content = resp.content
+    if not stream:
+        try:
+            result = resp.json()
+            result = convert_non_streaming_response(result)
+            return JSONResponse(content=result, status_code=resp.status_code)
+        except Exception:
+            pass
 
-    result = convert_non_streaming_response(result)
-    return JSONResponse(content=result, status_code=resp.status_code)
+    return Response(content=content, status_code=resp.status_code, headers=dict(resp.headers))
 
 
 @app.get("/v1/models")
@@ -396,18 +399,6 @@ async def models_list():
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
 async def catch_all_proxy(request: Request, path: str):
-    # Handle per-model query: GET /v1/models/{model_id}
-    if request.method == "GET" and path.startswith("v1/models/") and path.count("/") == 2:
-        model_id = path.split("/", 2)[2]
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(UPSTREAM + "/v1/models", timeout=None)
-        if resp.status_code == 200:
-            models = resp.json().get("data", [])
-            for m in models:
-                if m.get("id") == model_id:
-                    return JSONResponse(content=m, status_code=200)
-        return JSONResponse(content={"detail": "Not Found"}, status_code=404)
-
     body_bytes = await request.body()
     upstream_headers = strip_hop_by_hop_headers(dict(request.headers))
     upstream_headers.pop("host", None)

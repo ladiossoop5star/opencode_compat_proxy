@@ -317,50 +317,60 @@ async def proxy(request: Request):
         )
 
     if stream:
-        # Parse SSE lines, extract content for DSML detection
         sse_lines = upstream_resp.text.splitlines()
         full_content = ""
-        parsed_events = []
         for line in sse_lines:
-            if line.startswith("data: "):
-                payload = line[6:].strip()
+            if not line.startswith("data: ") and not line.startswith("data:"):
+                continue
+            colon = line.index(":") + 1
+            payload = line[colon:].strip()
+            if payload == "[DONE]":
+                continue
+            try:
+                ev = json.loads(payload)
+                delta = next((c.get("delta", {}) for c in ev.get("choices", [])), {})
+                for f in ("content", "reasoning", "reasoning_content"):
+                    v = delta.get(f)
+                    if isinstance(v, str):
+                        full_content += v
+            except Exception:
+                pass
+        tool_calls = []
+        if full_content:
+            normalized = normalize_raw_tool_calls(full_content)
+            if has_complete_raw_tool_block(normalized):
+                tool_calls = parse_raw_tool_calls(normalized)
+        if not tool_calls:
+            raw = normalize_raw_tool_calls(upstream_resp.text)
+            if has_complete_raw_tool_block(raw):
+                tool_calls = parse_raw_tool_calls(raw)
+        if tool_calls:
+            chunk_id = "chatcmpl-" + uuid.uuid4().hex[:12]
+            model = j.get("model", "deepseek")
+            tool_chunks = build_stream_tool_call_chunks(tool_calls, chunk_id, model)
+            lines = []
+            for line in sse_lines:
+                if not line.startswith("data: ") and not line.startswith("data:"):
+                    lines.append(line)
+                    continue
+                colon = line.index(":") + 1
+                payload = line[colon:].strip()
                 if payload == "[DONE]":
+                    lines.append(line)
                     continue
                 try:
                     ev = json.loads(payload)
-                    parsed_events.append(ev)
                     delta = next((c.get("delta", {}) for c in ev.get("choices", [])), {})
-                    for field in ("content", "reasoning", "reasoning_content"):
-                        val = delta.get(field)
-                        if isinstance(val, str):
-                            full_content += val
-                except json.JSONDecodeError:
+                    if "content" in delta or "reasoning" in delta or "reasoning_content" in delta:
+                        if "role" not in delta:
+                            continue
+                except Exception:
                     pass
-        normalized = normalize_raw_tool_calls(full_content)
-        if has_complete_raw_tool_block(normalized):
-            tool_calls = parse_raw_tool_calls(normalized)
-            if tool_calls:
-                chunk_id = "chatcmpl-" + uuid.uuid4().hex[:12]
-                model = j.get("model", "deepseek")
-                tool_chunks = build_stream_tool_call_chunks(tool_calls, chunk_id, model)
-                lines = []
-                for line in sse_lines:
-                    if not line.startswith("data: ") or line.strip() == "data: [DONE]":
-                        lines.append(line)
-                        continue
-                    try:
-                        ev = json.loads(line[6:])
-                        delta = next((c.get("delta", {}) for c in ev.get("choices", [])), {})
-                        if "content" in delta or "reasoning" in delta or "reasoning_content" in delta:
-                            if "role" not in delta:
-                                continue
-                    except Exception:
-                        pass
-                    lines.append(line)
-                for c in tool_chunks:
-                    lines.append("data: " + json.dumps(c))
-                lines.append("data: [DONE]")
-                return Response(content="\n".join(lines).encode(), status_code=upstream_resp.status_code, headers=dict(upstream_resp.headers))
+                lines.append(line)
+            for c in tool_chunks:
+                lines.append("data: " + json.dumps(c))
+            lines.append("data: [DONE]")
+            return Response(content="\n".join(lines).encode(), status_code=upstream_resp.status_code, headers=dict(upstream_resp.headers))
         return Response(content=upstream_resp.content, status_code=upstream_resp.status_code, headers=dict(upstream_resp.headers))
 
     try:

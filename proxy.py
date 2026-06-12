@@ -24,7 +24,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-UPSTREAM = os.environ.get("UPSTREAM_URL", "http://127.0.0.1:8000")
+UPSTREAM = os.environ.get("UPSTREAM_URL", "http://127.0.0.1:9527")
 HOST = os.environ.get("PROXY_HOST", "0.0.0.0")
 PORT = int(os.environ.get("PROXY_PORT", "9526"))
 

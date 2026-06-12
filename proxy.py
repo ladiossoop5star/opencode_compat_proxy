@@ -8,9 +8,17 @@ llama.cpp (port 8000).
 
 import html
 import json
+import logging
 import os
 import re
 import uuid
+
+logging.basicConfig(
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    level=logging.INFO,
+)
+log = logging.getLogger("proxy")
 
 import httpx
 from fastapi import FastAPI, Request
@@ -152,6 +160,9 @@ def parse_raw_tool_calls(text):
     tc = parse_qwen_xml_tool_calls(text)
     if tc:
         return tc
+    # tool block found but nothing parsed — log the block for debugging
+    if has_complete_raw_tool_block(text):
+        log.warning("parse_raw_tool_calls failed on: %s", text[:800])
     return []
 
 
@@ -168,13 +179,21 @@ def convert_non_streaming_response(body):
     msg = body.get("choices", [{}])[0].get("message", {})
     content = msg.get("content", "") or ""
     tool_calls = msg.get("tool_calls")
-    if not tool_calls and content and has_complete_raw_tool_block(content):
-        normalized = normalize_raw_tool_calls(content)
-        tool_calls = parse_raw_tool_calls(normalized)
-        if tool_calls:
-            msg["tool_calls"] = tool_calls
-            msg["content"] = None
-            body["choices"][0]["finish_reason"] = "tool_calls"
+    if tool_calls:
+        log.info("Upstream already has tool_calls: %s", json.dumps(tool_calls, ensure_ascii=False)[:500])
+    if not tool_calls and content:
+        if DSML_CLOSE in content or "</tool_calls>" in content or "</tool_call>" in content:
+            log.info("Raw tool close tag found in content (len=%d): %s", len(content), content[:500])
+        if has_complete_raw_tool_block(content):
+            normalized = normalize_raw_tool_calls(content)
+            tool_calls = parse_raw_tool_calls(normalized)
+            if tool_calls:
+                log.info("Converted %d tool_calls from non-stream content", len(tool_calls))
+                msg["tool_calls"] = tool_calls
+                msg["content"] = None
+                body["choices"][0]["finish_reason"] = "tool_calls"
+            else:
+                log.warning("has_complete_raw_tool_block true but parse empty! block=[%s]", content[:600])
     return body
 
 
@@ -298,8 +317,20 @@ async def proxy(request: Request):
     try:
         j = json.loads(body_bytes)
         stream = j.get("stream", False)
+        log.info("REQUEST: model=%s stream=%s msgs=%d tools=%d",
+                 j.get("model", "?"), stream,
+                 len(j.get("messages", [])),
+                 len(j.get("tools", [])))
+        for i, msg in enumerate(j.get("messages", [])):
+            role = msg.get("role", "?")
+            content = msg.get("content", "")
+            tc = msg.get("tool_calls")
+            log.info("  msg[%d] role=%s content_len=%d tool_calls=%s",
+                     i, role, len(content or ""),
+                     len(tc) if tc else 0)
     except Exception:
-        pass
+        j = None
+        log.info("REQUEST (raw): %s", body_bytes.decode("utf-8", errors="replace")[:1000])
 
     client_host = request.client.host if request.client else "unknown"
     upstream_headers = strip_hop_by_hop_headers(dict(request.headers))
@@ -335,6 +366,8 @@ async def proxy(request: Request):
                         full_content += v
             except Exception:
                 pass
+        if DSML_CLOSE in full_content or "</tool_calls>" in full_content or "</tool_call>" in full_content:
+            log.info("Stream full_content has tool close tag (len=%d): %s", len(full_content), full_content[:600])
         tool_calls = []
         if full_content:
             normalized = normalize_raw_tool_calls(full_content)
@@ -346,9 +379,11 @@ async def proxy(request: Request):
                 tool_calls = parse_raw_tool_calls(raw)
         if tool_calls:
             chunk_id = "chatcmpl-" + uuid.uuid4().hex[:12]
-            model = j.get("model", "deepseek")
+            model = j.get("model", "deepseek") if j else "deepseek"
+            log.info("Tool calls detected: %s", json.dumps(tool_calls, ensure_ascii=False))
             tool_chunks = build_stream_tool_call_chunks(tool_calls, chunk_id, model)
             lines = []
+            role_fixed = False
             for line in sse_lines:
                 if not line.startswith("data: ") and not line.startswith("data:"):
                     lines.append(line)
@@ -356,28 +391,59 @@ async def proxy(request: Request):
                 colon = line.index(":") + 1
                 payload = line[colon:].strip()
                 if payload == "[DONE]":
-                    lines.append(line)
-                    continue
+                    continue  # skip original [DONE]; we add our own at the end
                 try:
                     ev = json.loads(payload)
-                    delta = next((c.get("delta", {}) for c in ev.get("choices", [])), {})
+                    choices = ev.get("choices", [])
+                    if not choices:
+                        continue  # skip usage-only chunks (empty choices)
+                    delta = choices[0].get("delta", {})
+                    if "role" in delta and not role_fixed:
+                        # force content:null so SDK treats it as assistant+tools, not text
+                        delta["content"] = None
+                        ev["choices"][0]["delta"] = delta
+                        line = "data: " + json.dumps(ev)
+                        role_fixed = True
                     if "content" in delta or "reasoning" in delta or "reasoning_content" in delta:
                         if "role" not in delta:
                             continue
+                    # skip upstream's finish_reason (we emit our own tool_calls finish)
+                    if choices[0].get("finish_reason") in ("stop", "length"):
+                        continue
                 except Exception:
                     pass
                 lines.append(line)
             for c in tool_chunks:
                 lines.append("data: " + json.dumps(c))
             lines.append("data: [DONE]")
-            return Response(content="\n".join(lines).encode(), status_code=upstream_resp.status_code, headers=dict(upstream_resp.headers))
+            log.info("RESPONSE: stream with tool_calls, total lines=%d, resp_len=%d",
+                     len(lines), sum(len(l) for l in lines))
+            log.info("RESPONSE first 3 lines: %s",
+                     "\\n".join(l[:200] for l in lines[:3]))
+            log.info("RESPONSE last 3 lines: %s",
+                     "\\n".join(l[:200] for l in lines[-3:]))
+            resp_headers = {k: v for k, v in upstream_resp.headers.items()
+                            if k.lower() not in ("content-length",)}
+            return Response(content="\n".join(lines).encode(), status_code=upstream_resp.status_code, headers=resp_headers)
+        elif full_content and has_complete_raw_tool_block(full_content):
+            log.warning("Raw tool block detected but parsing returned empty! raw=[%s]", full_content[:500])
+        log.info("RESPONSE: stream passthrough (no tool calls), len=%d", len(upstream_resp.content))
         return Response(content=upstream_resp.content, status_code=upstream_resp.status_code, headers=dict(upstream_resp.headers))
 
     try:
         result = upstream_resp.json()
         result = convert_non_streaming_response(result)
+        msg = result.get("choices", [{}])[0].get("message", {})
+        finish = result.get("choices", [{}])[0].get("finish_reason", "?")
+        content_preview = (msg.get("content") or "")[:200].replace("\n", "\\n")
+        if msg.get("tool_calls"):
+            log.info("RESPONSE: non-stream tool_calls=%d finish=%s",
+                     len(msg["tool_calls"]), finish)
+        else:
+            log.info("RESPONSE: non-stream finish=%s content=%s", finish, content_preview)
         return JSONResponse(content=result, status_code=upstream_resp.status_code)
-    except Exception:
+    except Exception as e:
+        log.info("RESPONSE: non-stream error=%s, raw_len=%d", e, len(upstream_resp.content))
         return Response(content=upstream_resp.content, status_code=upstream_resp.status_code, headers=dict(upstream_resp.headers))
 
 
@@ -385,6 +451,7 @@ async def proxy(request: Request):
 async def models_list():
     async with httpx.AsyncClient() as client:
         resp = await client.get(UPSTREAM + "/v1/models", timeout=None)
+    log.info("MODELS: %d models returned", len(resp.json().get("data", [])))
     return JSONResponse(content=resp.json(), status_code=resp.status_code)
 
 
@@ -394,6 +461,8 @@ async def models_list():
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
 async def catch_all_proxy(request: Request, path: str):
     body_bytes = await request.body()
+    log.info("CATCH-ALL %s /%s body=%s", request.method, path,
+             body_bytes.decode("utf-8", errors="replace")[:500])
     upstream_headers = strip_hop_by_hop_headers(dict(request.headers))
     upstream_headers.pop("host", None)
     client_host = request.client.host if request.client else "unknown"
@@ -407,6 +476,8 @@ async def catch_all_proxy(request: Request, path: str):
             content=body_bytes,
             timeout=None,
         )
+    log.info("CATCH-ALL %s /%s -> %d (len=%d)", request.method, path,
+             resp.status_code, len(resp.content))
     return Response(content=resp.content, status_code=resp.status_code, headers=dict(resp.headers))
 
 

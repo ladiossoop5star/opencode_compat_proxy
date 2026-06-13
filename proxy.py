@@ -24,7 +24,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-UPSTREAM = os.environ.get("UPSTREAM_URL", "http://127.0.0.1:8000")
+UPSTREAM = os.environ.get("UPSTREAM_URL", "http://127.0.0.1:9527")
 HOST = os.environ.get("PROXY_HOST", "0.0.0.0")
 PORT = int(os.environ.get("PROXY_PORT", "9526"))
 
@@ -279,10 +279,10 @@ async def stream_compat_response(upstream_req, forwarded_for=""):
                 timeout=None,
             ) as resp:
                 async for line in resp.aiter_lines():
-                    if not line or line.strip() == "data: [DONE]":
+                    if not line:
                         continue
-                    yield line + "\n\n"
-                    if not line.startswith("data: "):
+                    yield line + "\n"
+                    if not line.startswith("data: ") or line.strip() == "data: [DONE]":
                         continue
                     try:
                         chunk = json.loads(line[6:])
@@ -306,8 +306,6 @@ async def stream_compat_response(upstream_req, forwarded_for=""):
                             ):
                                 yield "data: " + json.dumps(tc_chunk) + "\n\n"
                             return
-                # Stream ended without tool calls — signal [DONE]
-                yield "data: [DONE]\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 
@@ -341,10 +339,6 @@ async def proxy(request: Request):
     if not upstream_headers.get("x-forwarded-for"):
         upstream_headers["x-forwarded-for"] = client_host
 
-    if stream:
-        log.info("RESPONSE: streaming via stream_compat_response")
-        return await stream_compat_response(j, client_host)
-
     async with httpx.AsyncClient() as client:
         upstream_resp = await client.post(
             UPSTREAM + "/v1/chat/completions",
@@ -352,6 +346,89 @@ async def proxy(request: Request):
             headers=upstream_headers,
             timeout=None,
         )
+
+    if stream:
+        sse_lines = upstream_resp.text.splitlines()
+        full_content = ""
+        for line in sse_lines:
+            if not line.startswith("data: ") and not line.startswith("data:"):
+                continue
+            colon = line.index(":") + 1
+            payload = line[colon:].strip()
+            if payload == "[DONE]":
+                continue
+            try:
+                ev = json.loads(payload)
+                delta = next((c.get("delta", {}) for c in ev.get("choices", [])), {})
+                for f in ("content", "reasoning", "reasoning_content"):
+                    v = delta.get(f)
+                    if isinstance(v, str):
+                        full_content += v
+            except Exception:
+                pass
+        if DSML_CLOSE in full_content or "</tool_calls>" in full_content or "</tool_call>" in full_content:
+            log.info("Stream full_content has tool close tag (len=%d): %s", len(full_content), full_content[:600])
+        tool_calls = []
+        if full_content:
+            normalized = normalize_raw_tool_calls(full_content)
+            if has_complete_raw_tool_block(normalized):
+                tool_calls = parse_raw_tool_calls(normalized)
+        if not tool_calls:
+            raw = normalize_raw_tool_calls(upstream_resp.text)
+            if has_complete_raw_tool_block(raw):
+                tool_calls = parse_raw_tool_calls(raw)
+        if tool_calls:
+            chunk_id = "chatcmpl-" + uuid.uuid4().hex[:12]
+            model = j.get("model", "deepseek") if j else "deepseek"
+            log.info("Tool calls detected: %s", json.dumps(tool_calls, ensure_ascii=False))
+            tool_chunks = build_stream_tool_call_chunks(tool_calls, chunk_id, model)
+            lines = []
+            role_fixed = False
+            for line in sse_lines:
+                if not line.startswith("data: ") and not line.startswith("data:"):
+                    lines.append(line)
+                    continue
+                colon = line.index(":") + 1
+                payload = line[colon:].strip()
+                if payload == "[DONE]":
+                    continue  # skip original [DONE]; we add our own at the end
+                try:
+                    ev = json.loads(payload)
+                    choices = ev.get("choices", [])
+                    if not choices:
+                        continue  # skip usage-only chunks (empty choices)
+                    delta = choices[0].get("delta", {})
+                    if "role" in delta and not role_fixed:
+                        # force content:null so SDK treats it as assistant+tools, not text
+                        delta["content"] = None
+                        ev["choices"][0]["delta"] = delta
+                        line = "data: " + json.dumps(ev)
+                        role_fixed = True
+                    if "content" in delta or "reasoning" in delta or "reasoning_content" in delta:
+                        if "role" not in delta:
+                            continue
+                    # skip upstream's finish_reason (we emit our own tool_calls finish)
+                    if choices[0].get("finish_reason") in ("stop", "length"):
+                        continue
+                except Exception:
+                    pass
+                lines.append(line)
+            for c in tool_chunks:
+                lines.append("data: " + json.dumps(c))
+            lines.append("data: [DONE]")
+            log.info("RESPONSE: stream with tool_calls, total lines=%d, resp_len=%d",
+                     len(lines), sum(len(l) for l in lines))
+            log.info("RESPONSE first 3 lines: %s",
+                     "\\n".join(l[:200] for l in lines[:3]))
+            log.info("RESPONSE last 3 lines: %s",
+                     "\\n".join(l[:200] for l in lines[-3:]))
+            resp_headers = {k: v for k, v in upstream_resp.headers.items()
+                            if k.lower() not in ("content-length",)}
+            return Response(content="\n".join(lines).encode(), status_code=upstream_resp.status_code, headers=resp_headers)
+        elif full_content and has_complete_raw_tool_block(full_content):
+            log.warning("Raw tool block detected but parsing returned empty! raw=[%s]", full_content[:500])
+        log.info("RESPONSE: stream passthrough (no tool calls), len=%d", len(upstream_resp.content))
+        return Response(content=upstream_resp.content, status_code=upstream_resp.status_code, headers=dict(upstream_resp.headers))
 
     try:
         result = upstream_resp.json()

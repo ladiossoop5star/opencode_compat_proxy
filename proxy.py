@@ -350,7 +350,21 @@ async def stream_with_sections(upstream_req, forwarded_for=""):
                     text = delta.get("content", "")
 
                     if reasoning:
-                        yield raw_line + "\n\n"
+                        if text:
+                            r_delta = {}
+                            if delta.get("reasoning"):
+                                r_delta["reasoning"] = delta["reasoning"]
+                            if delta.get("reasoning_content"):
+                                r_delta["reasoning_content"] = delta["reasoning_content"]
+                            r_ev = {
+                                "id": chunk_id,
+                                "object": "chat.completion.chunk",
+                                "model": model,
+                                "choices": [{"index": 0, "delta": r_delta}],
+                            }
+                            yield "data: " + json.dumps(r_ev) + "\n\n"
+                        else:
+                            yield raw_line + "\n\n"
                     if not text:
                         if not reasoning and not dsml_mode:
                             yield raw_line + "\n\n"
@@ -393,6 +407,13 @@ async def stream_with_sections(upstream_req, forwarded_for=""):
                         yield _make_content_sse(chunk_id, model, s)
                     if unflushed:
                         yield _make_content_sse(chunk_id, model, unflushed)
+                    finish_ev = {
+                        "id": chunk_id,
+                        "object": "chat.completion.chunk",
+                        "model": model,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    }
+                    yield "data: " + json.dumps(finish_ev) + "\n\n"
 
                 yield "data: [DONE]\n\n"
 

@@ -351,7 +351,7 @@ async def stream_with_sections(upstream_req, forwarded_for=""):
 
                     if reasoning:
                         if text:
-                            r_delta = {}
+                            r_delta = {"tool_calls": []}
                             if delta.get("reasoning"):
                                 r_delta["reasoning"] = delta["reasoning"]
                             if delta.get("reasoning_content"):
@@ -411,7 +411,7 @@ async def stream_with_sections(upstream_req, forwarded_for=""):
                         "id": chunk_id,
                         "object": "chat.completion.chunk",
                         "model": model,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        "choices": [{"index": 0, "delta": {"content": "", "tool_calls": []}, "finish_reason": "stop"}],
                     }
                     yield "data: " + json.dumps(finish_ev) + "\n\n"
 

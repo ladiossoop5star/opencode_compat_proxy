@@ -361,6 +361,10 @@ async def stream_proxy(upstream_req, forwarded_for=""):
                         else:
                             yield raw_line + "\n\n"
 
+                    finish_reason = choices[0].get("finish_reason")
+                    if finish_reason and not text and not reasoning:
+                        continue
+
                     if not text:
                         if not reasoning:
                             yield raw_line + "\n\n"
